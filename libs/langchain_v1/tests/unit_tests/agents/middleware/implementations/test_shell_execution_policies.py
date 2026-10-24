@@ -222,13 +222,30 @@ def test_codex_policy_spawns_codex_cli(monkeypatch: pytest.MonkeyPatch, tmp_path
     expected = [
         shutil.which("codex"),
         "sandbox",
-        "linux",
         "-c",
         'sandbox_permissions=["disk-full-read-access"]',
         "--",
         "/bin/bash",
     ]
     assert recorded["command"] == expected
+
+
+def test_codex_policy_omits_platform_positional(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The platform positional must not leak into the built command.
+
+    Modern codex-cli versions treat any extra positional after `codex sandbox` as
+    the command to run, so `codex sandbox linux -- ...` fails with an
+    `execvp linux` panic. An explicit `platform` must be accepted (backward
+    compatibility) but ignored.
+    """
+    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/codex")
+    policy = CodexSandboxExecutionPolicy(platform="linux")
+
+    command = policy._build_command(("echo",))
+
+    assert command == ["/usr/bin/codex", "sandbox", "--", "echo"]
+    assert "linux" not in command
+    assert "macos" not in command
 
 
 def test_codex_policy_auto_platform_linux(monkeypatch: pytest.MonkeyPatch) -> None:

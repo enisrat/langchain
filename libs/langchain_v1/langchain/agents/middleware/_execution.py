@@ -201,6 +201,13 @@ class CodexSandboxExecutionPolicy(BaseExecutionPolicy):
     Configure sandbox behavior via `config_overrides` to align with your Codex CLI
     profile. This policy does not add its own resource limits; combine it with
     host-level guards (cgroups, container resource limits) as needed.
+
+    Modern codex-cli versions select the platform sandbox (Seatbelt on macOS,
+    Landlock/seccomp on Linux) themselves and treat any extra positional after
+    `codex sandbox` as the command to run. The command is therefore launched as
+    `codex sandbox [overrides] -- <command>`, without a platform positional. The
+    `platform` field is retained for backward compatibility but no longer affects
+    the spawned command.
     """
 
     binary: str = "codex"
@@ -224,9 +231,7 @@ class CodexSandboxExecutionPolicy(BaseExecutionPolicy):
         )
 
     def _build_command(self, command: Sequence[str]) -> list[str]:
-        binary = self._resolve_binary()
-        platform_arg = self._determine_platform()
-        full_command: list[str] = [binary, "sandbox", platform_arg]
+        full_command: list[str] = [self._resolve_binary(), "sandbox"]
         for key, value in sorted(dict(self.config_overrides).items()):
             full_command.extend(["-c", f"{key}={self._format_override(value)}"])
         full_command.append("--")

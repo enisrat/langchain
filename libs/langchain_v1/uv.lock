@@ -2324,7 +2324,7 @@ wheels = [
 
 [[package]]
 name = "langchain"
-version = "1.4.7+enisrat"
+version = "1.4.8+enisrat"
 source = { editable = "." }
 dependencies = [
     { name = "langchain-core" },
