@@ -6,12 +6,12 @@ import contextlib
 import logging
 import os
 import queue
+import secrets
 import signal
 import subprocess
 import tempfile
 import threading
 import time
-import uuid
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,7 +54,9 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger(__name__)
-_DONE_MARKER_PREFIX = "__LC_SHELL_DONE__"
+_MARKER_BYTES = 16
+_MARKER_LEN = _MARKER_BYTES * 2  # hex-encoded, so 32 ASCII characters
+_EXIT_CODE_WIDTH = 3  # zero-padded `$?` field (exit codes are 0-255)
 
 DEFAULT_TOOL_DESCRIPTION = (
     "Execute a shell command inside a persistent session. Before running a command, "
@@ -143,6 +145,11 @@ class ShellSession:
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._terminated = False
+        # Random completion cookie shared by every command in this session. It is
+        # injected after each command and detected as a line *suffix* (see
+        # `_split_marker_line`) so commands whose output lacks a trailing
+        # newline cannot hide it.
+        self._marker = secrets.token_hex(_MARKER_BYTES)
 
     def start(self) -> None:
         """Start the shell subprocess and reader threads.
@@ -220,7 +227,6 @@ class ShellSession:
             msg = "Shell session is not running."
             raise RuntimeError(msg)
 
-        marker = f"{_DONE_MARKER_PREFIX}{uuid.uuid4().hex}"
         deadline = time.monotonic() + timeout
 
         with self._lock:
@@ -228,18 +234,22 @@ class ShellSession:
             payload = command if command.endswith("\n") else f"{command}\n"
             try:
                 self._stdin.write(payload)
-                self._stdin.write(f"printf '{marker} %s\\n' $?\n")
+                # The marker ends the line so completion can be detected by
+                # comparing the line's trailing bytes even when the command's
+                # output lacks a trailing newline. The zero-padded exit code
+                # sits in a fixed-width field before the marker, which keeps
+                # parsing unambiguous regardless of the output's content.
+                self._stdin.write(f"printf '%0{_EXIT_CODE_WIDTH}d {self._marker}\\n' \"$?\"\n")
                 self._stdin.flush()
             except (BrokenPipeError, OSError):
                 # The shell exited before we could write the marker command.
                 # This happens when commands like 'exit 1' terminate the shell.
                 return self._collect_output_after_exit(deadline)
 
-            return self._collect_output(marker, deadline, timeout)
+            return self._collect_output(deadline, timeout)
 
     def _collect_output(
         self,
-        marker: str,
         deadline: float,
         timeout: float,
     ) -> CommandExecutionResult:
@@ -265,9 +275,23 @@ class ShellSession:
             if data is None:
                 continue
 
-            if source == "stdout" and data.startswith(marker):
-                _, _, status = data.partition(" ")
-                exit_code = self._safe_int(status.strip())
+            if source == "stdout" and (split := self._split_marker_line(data)):
+                remainder, exit_code = split
+                if remainder:
+                    # The marker absorbed the command's unterminated final line;
+                    # account for it like any other output line.
+                    total_lines += 1
+                    encoded = remainder.encode("utf-8", "replace")
+                    total_bytes += len(encoded)
+                    if total_lines > self._policy.max_output_lines:
+                        truncated_by_lines = True
+                    elif (
+                        self._policy.max_output_bytes is not None
+                        and total_bytes > self._policy.max_output_bytes
+                    ):
+                        truncated_by_bytes = True
+                    else:
+                        collected.append(remainder)
                 # Drain any remaining stderr that may have arrived concurrently.
                 # The stderr reader thread runs independently, so output might
                 # still be in flight when the stdout marker arrives.
@@ -480,6 +504,35 @@ class ShellSession:
             collected.append(f"[stderr] {stripped}")
             if data.endswith("\n"):
                 collected.append("\n")
+
+    def _split_marker_line(self, data: str) -> tuple[str, int | None] | None:
+        """Split a stdout line that ends with the session's completion marker.
+
+        The marker command emits `<exit-code> <marker>` on stdout, with the
+        marker always as the last `_MARKER_LEN` characters of the line. When a
+        command's output does not end with a newline, that output and the marker
+        arrive as a single line, so the marker is detected by comparing the
+        line's trailing characters and then cut off. The exit code is encoded in
+        a fixed-width field immediately before the marker, which keeps parsing
+        unambiguous even when the absorbed output ends with digits or spaces.
+
+        Args:
+            data: The stdout line read from the session queue.
+
+        Returns:
+            A `(output, exit_code)` tuple when the line ends with the marker,
+            where `output` is any command output the marker line absorbed
+            (possibly empty), or `None` when the line is regular output.
+        """
+        stripped = data.removesuffix("\n")
+        if not stripped.endswith(self._marker):
+            return None
+        prefix = stripped.removesuffix(self._marker).removesuffix(" ")
+        if len(prefix) < _EXIT_CODE_WIDTH:
+            return "", self._safe_int(prefix)
+        status = prefix[-_EXIT_CODE_WIDTH:]
+        output = prefix[: len(prefix) - _EXIT_CODE_WIDTH]
+        return output, self._safe_int(status)
 
     @staticmethod
     def _safe_int(value: str) -> int | None:

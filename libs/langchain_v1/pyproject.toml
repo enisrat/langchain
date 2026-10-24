@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-version = "1.4.7"
+version = "1.4.7+enisrat"
 requires-python = ">=3.10.0,<4.0.0"
 dependencies = [
     "langchain-core>=1.6.13,<2.0.0",

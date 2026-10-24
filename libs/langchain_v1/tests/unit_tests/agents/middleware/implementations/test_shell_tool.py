@@ -18,6 +18,7 @@ from langgraph.runtime import Runtime
 
 from langchain.agents.factory import create_agent
 from langchain.agents.middleware.shell_tool import (
+    _MARKER_LEN,
     HostExecutionPolicy,
     RedactionRule,
     ShellSession,
@@ -31,6 +32,109 @@ from tests.unit_tests.agents.model import FakeToolCallingModel
 
 def _empty_state() -> ShellToolState:
     return {"messages": []}
+
+
+def _start_session(tmp_path: Path) -> ShellSession:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    session = ShellSession(
+        workspace=workspace,
+        policy=HostExecutionPolicy(command_timeout=5.0),
+        command=("/bin/bash",),
+        environment={},
+    )
+    session.start()
+    return session
+
+
+def test_execute_output_without_trailing_newline(tmp_path: Path) -> None:
+    """Completion must be detected when output lacks a trailing newline.
+
+    Regression test: the marker used to be detected only at the start of a
+    stdout line, so unterminated command output swallowed the marker and the
+    command falsely hit `command_timeout`.
+    """
+    session = _start_session(tmp_path)
+    try:
+        result = session.execute("printf 'hello without newline'", timeout=5.0)
+        assert result.output == "hello without newline"
+        assert result.exit_code == 0
+        assert not result.timed_out
+    finally:
+        session.stop(1.0)
+
+
+def test_execute_exit_code_parsed_with_unterminated_digit_output(tmp_path: Path) -> None:
+    """Unterminated output ending in digits must not corrupt the exit code."""
+    session = _start_session(tmp_path)
+    try:
+        result = session.execute("printf 'abc123'; false", timeout=5.0)
+        assert result.output == "abc123"
+        assert result.exit_code == 1
+        assert not result.timed_out
+    finally:
+        session.stop(1.0)
+
+
+def test_execute_preserves_trailing_spaces_in_unterminated_output(tmp_path: Path) -> None:
+    """Trailing whitespace absorbed by the marker line must survive the cut."""
+    session = _start_session(tmp_path)
+    try:
+        result = session.execute("printf 'hello '", timeout=5.0)
+        assert result.output == "hello "
+        assert result.exit_code == 0
+    finally:
+        session.stop(1.0)
+
+
+def test_execute_multiline_output_with_unterminated_tail(tmp_path: Path) -> None:
+    """Only the final unterminated line may merge with the marker line."""
+    session = _start_session(tmp_path)
+    try:
+        result = session.execute("echo a; echo b; printf 'tail'", timeout=5.0)
+        assert result.output == "a\nb\ntail"
+        assert result.exit_code == 0
+        assert result.total_lines == 3
+    finally:
+        session.stop(1.0)
+
+
+def test_marker_is_random_hex_cookie_per_session(tmp_path: Path) -> None:
+    """The completion cookie is a 32-char random hex string, unique per session."""
+    session_a = ShellSession(tmp_path, HostExecutionPolicy(), ("/bin/bash",), {})
+    session_b = ShellSession(tmp_path, HostExecutionPolicy(), ("/bin/bash",), {})
+    assert len(session_a._marker) == _MARKER_LEN
+    assert session_a._marker == session_a._marker.lower()
+    assert int(session_a._marker, 16) >= 0  # parses as hex
+    assert session_a._marker != session_b._marker
+
+
+def test_split_marker_line_variants(tmp_path: Path) -> None:
+    """`_split_marker_line` parses clean, merged, and non-marker lines."""
+    session = ShellSession(tmp_path, HostExecutionPolicy(), ("/bin/bash",), {})
+    marker = session._marker
+
+    # Clean marker line (command output ended with a newline).
+    assert session._split_marker_line(f"000 {marker}\n") == ("", 0)
+    assert session._split_marker_line(f"001 {marker}\n") == ("", 1)
+    assert session._split_marker_line(f"255 {marker}\n") == ("", 255)
+
+    # Marker merged with unterminated command output.
+    assert session._split_marker_line(f"hello without newline000 {marker}\n") == (
+        "hello without newline",
+        0,
+    )
+    assert session._split_marker_line(f"abc123001 {marker}\n") == ("abc123", 1)
+    assert session._split_marker_line(f"trailing 000 {marker}\n") == ("trailing ", 0)
+
+    # EOF edge: marker arrived without the trailing newline.
+    assert session._split_marker_line(f"000 {marker}") == ("", 0)
+
+    # Regular output lines are not marker lines.
+    assert session._split_marker_line("regular output\n") is None
+    assert session._split_marker_line("") is None
+    # A line merely *containing* the marker (not at the end) is regular output.
+    assert session._split_marker_line(f"{marker} not at end\n") is None
 
 
 def test_executes_command_and_persists_state(tmp_path: Path) -> None:
